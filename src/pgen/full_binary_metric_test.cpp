@@ -102,6 +102,7 @@ void Binary_BH_Metric(Real t, Real x1, Real x2, Real x3,
 void BoostVector(int BH_INDEX, Real t, Real a0, Real a1, Real a2, Real a3,AthenaArray<Real>&orbit_quantities, Real *pa0, Real *pa1, Real *pa2, Real *pa3);
 
 Real DivergenceB(MeshBlock *pmb, int iout);
+Real HorizonFlux(MeshBlock *pmb, int iout);
 
 void set_orbit_arrays(std::string orbit_file_name);
 
@@ -141,6 +142,8 @@ static Real q;          // black hole mass and spin
 static Real t0; //time at which second BH is at polar axis
 static Real orbit_inclination;
 static Real magnetic_field_inclination, r_cut, field_norm;
+static Real mdot_radius, phi_radius;  // flux spheres, in units of each BH's mass
+static const int flux_ntheta = 64, flux_nphi = 128;  // points on each flux sphere
 
 static Real t0_orbits,dt_orbits;
 
@@ -297,9 +300,15 @@ void Mesh::InitUserMeshData(ParameterInput *pin) {
   EnrollUserRadSourceFunction(inner_boundary_source_function);
 
   if (MAGNETIC_FIELDS_ENABLED) {
-    AllocateUserHistoryOutput(1);
+    AllocateUserHistoryOutput(5);
     EnrollUserHistoryOutput(0, DivergenceB, "divB");
+    EnrollUserHistoryOutput(1, HorizonFlux, "mdot1");
+    EnrollUserHistoryOutput(2, HorizonFlux, "mdot2");
+    EnrollUserHistoryOutput(3, HorizonFlux, "phi1");
+    EnrollUserHistoryOutput(4, HorizonFlux, "phi2");
   }
+  mdot_radius = pin->GetOrAddReal("problem", "mdot_radius", 2.125);
+  phi_radius = pin->GetOrAddReal("problem", "phi_radius", 2.0);
 
 
   t0 = pin->GetOrAddReal("problem","t0", 0.0);
@@ -2579,6 +2588,149 @@ Real DivergenceB(MeshBlock *pmb, int iout)
   face3m.DeleteAthenaArray();
 
   return divb;
+}
+
+//----------------------------------------------------------------------------------------
+// Trilinear interpolation of rho, the normal-frame velocity utilde^i and B^i to the point
+// (x,y,z) inside the MeshBlock, from the 8 surrounding cell centres (ghost cells at the
+// MeshBlock edges), for HorizonFlux.
+
+static void InterpolatePrimitives(MeshBlock *pmb, Real x, Real y, Real z, Real prim[7]) {
+  Coordinates *pco = pmb->pcoord;
+  const AthenaArray<Real> &w = pmb->phydro->w;
+  const AthenaArray<Real> &bcc = pmb->pfield->bcc;
+  Real s1 = (x - pco->x1v(pmb->is))/pco->dx1v(pmb->is);
+  Real s2 = (y - pco->x2v(pmb->js))/pco->dx2v(pmb->js);
+  Real s3 = (z - pco->x3v(pmb->ks))/pco->dx3v(pmb->ks);
+  int i0 = pmb->is + static_cast<int>(std::floor(s1));
+  int j0 = pmb->js + static_cast<int>(std::floor(s2));
+  int k0 = pmb->ks + static_cast<int>(std::floor(s3));
+  Real w1 = s1 - std::floor(s1);
+  Real w2 = s2 - std::floor(s2);
+  Real w3 = s3 - std::floor(s3);
+
+  for (int n=0; n<7; ++n) prim[n] = 0.0;
+  for (int dk=0; dk<=1; ++dk) {
+    for (int dj=0; dj<=1; ++dj) {
+      for (int di=0; di<=1; ++di) {
+        Real weight = (di ? w1 : 1.0-w1) * (dj ? w2 : 1.0-w2) * (dk ? w3 : 1.0-w3);
+        int k = k0+dk, j = j0+dj, i = i0+di;
+        prim[0] += weight * w(IDN,k,j,i);
+        prim[1] += weight * w(IVX,k,j,i);
+        prim[2] += weight * w(IVY,k,j,i);
+        prim[3] += weight * w(IVZ,k,j,i);
+        prim[4] += weight * bcc(IB1,k,j,i);
+        prim[5] += weight * bcc(IB2,k,j,i);
+        prim[6] += weight * bcc(IB3,k,j,i);
+      }
+    }
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+// Rest-mass and magnetic flux densities at the point (x,y,z), for HorizonFlux:
+//   flux_m^i = sqrt(-g) rho (u^i - u^0 v^i),  flux_b^i = sqrt(-g) B^i,
+// with the binary metric evaluated at the point at time t, v^i the BH's coordinate
+// velocity, and u^mu from the normal-frame velocity (u^0 = gamma/alpha,
+// u^i = utilde^i - alpha gamma g^{0i}).
+
+static void FluxDensity(Real t, Real x, Real y, Real z, const Real prim[7],
+                        Real vx, Real vy, Real vz,
+                        AthenaArray<Real> &g, AthenaArray<Real> &gi, AthenaArray<Real> &dg,
+                        Real flux_m[3], Real flux_b[3]) {
+  Binary_BH_Metric(t, x, y, z, g, gi, dg, dg, dg, dg, false);
+  Real sqrt_minus_g = std::sqrt(-Determinant(g));
+  Real alpha = std::sqrt(-1.0/gi(I00));
+
+  Real uu1 = prim[1];
+  Real uu2 = prim[2];
+  Real uu3 = prim[3];
+  Real tmp = g(I11)*uu1*uu1 + 2.0*g(I12)*uu1*uu2 + 2.0*g(I13)*uu1*uu3
+           + g(I22)*uu2*uu2 + 2.0*g(I23)*uu2*uu3
+           + g(I33)*uu3*uu3;
+  Real gamma = std::sqrt(1.0 + tmp);
+  Real u0 = gamma/alpha;
+  Real u1 = uu1 - alpha * gamma * gi(I01);
+  Real u2 = uu2 - alpha * gamma * gi(I02);
+  Real u3 = uu3 - alpha * gamma * gi(I03);
+
+  flux_m[0] = sqrt_minus_g * prim[0] * (u1 - u0*vx);
+  flux_m[1] = sqrt_minus_g * prim[0] * (u2 - u0*vy);
+  flux_m[2] = sqrt_minus_g * prim[0] * (u3 - u0*vz);
+  flux_b[0] = sqrt_minus_g * prim[4];
+  flux_b[1] = sqrt_minus_g * prim[5];
+  flux_b[2] = sqrt_minus_g * prim[6];
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+// History outputs 1-4: accretion rate (mdot1, mdot2) and magnetic flux (phi1, phi2) of
+// each BH, through a sphere of radius mdot_radius or phi_radius times the BH's mass,
+// centred on the BH and moving with it (orbit and metric at the metric time):
+//   Mdot = - oint sqrt(-g) rho (u^i - u^0 v^i) n_i dA,  Phi = 1/2 oint |sqrt(-g) B^i n_i| dA,
+// with n_i the flat-space unit normal. Points uniform in cos(theta) and phi; each MeshBlock
+// sums the points inside it, and the history output sums the MeshBlocks.
+
+Real HorizonFlux(MeshBlock *pmb, int iout) {
+  const int bh = (iout == 1 || iout == 3) ? 1 : 2;
+  const bool mass_flux = (iout <= 2);
+
+  AthenaArray<Real> orbit_quantities;
+  orbit_quantities.NewAthenaArray(Norbit);
+  get_orbit_quantities(pmb->pmy_mesh->metric_time, orbit_quantities);
+  Real xbh = orbit_quantities(bh == 1 ? IX1 : IX2);
+  Real ybh = orbit_quantities(bh == 1 ? IY1 : IY2);
+  Real zbh = orbit_quantities(bh == 1 ? IZ1 : IZ2);
+  Real vx = orbit_quantities(bh == 1 ? IV1X : IV2X);
+  Real vy = orbit_quantities(bh == 1 ? IV1Y : IV2Y);
+  Real vz = orbit_quantities(bh == 1 ? IV1Z : IV2Z);
+  orbit_quantities.DeleteAthenaArray();
+  Real radius = (mass_flux ? mdot_radius : phi_radius) * (bh == 1 ? m : q);
+
+  // skip MeshBlocks that the sphere does not reach
+  const RegionSize &bs = pmb->block_size;
+  if (xbh + radius < bs.x1min || xbh - radius >= bs.x1max ||
+      ybh + radius < bs.x2min || ybh - radius >= bs.x2max ||
+      zbh + radius < bs.x3min || zbh - radius >= bs.x3max) return 0.0;
+
+  const Real t = pmb->pmy_mesh->metric_time;
+  AthenaArray<Real> g, gi, dg;
+  g.NewAthenaArray(NMETRIC);
+  gi.NewAthenaArray(NMETRIC);
+  dg.NewAthenaArray(NMETRIC);
+
+  const Real dmu = 2.0/flux_ntheta;
+  const Real dphi = 2.0*PI/flux_nphi;
+  const Real area = SQR(radius) * dmu * dphi;
+  Real sum = 0.0;
+  for (int a=0; a<flux_ntheta; ++a) {
+    Real mu = -1.0 + (a + 0.5)*dmu;
+    Real sin_theta = std::sqrt(1.0 - SQR(mu));
+    for (int b=0; b<flux_nphi; ++b) {
+      Real phi = (b + 0.5)*dphi;
+      Real nx = sin_theta*std::cos(phi);
+      Real ny = sin_theta*std::sin(phi);
+      Real nz = mu;
+      Real x = xbh + radius*nx;
+      Real y = ybh + radius*ny;
+      Real z = zbh + radius*nz;
+      if (x < bs.x1min || x >= bs.x1max || y < bs.x2min || y >= bs.x2max ||
+          z < bs.x3min || z >= bs.x3max) continue;
+      Real prim[7], flux_m[3], flux_b[3];
+      InterpolatePrimitives(pmb, x, y, z, prim);
+      FluxDensity(t, x, y, z, prim, vx, vy, vz, g, gi, dg, flux_m, flux_b);
+      if (mass_flux)
+        sum -= (flux_m[0]*nx + flux_m[1]*ny + flux_m[2]*nz) * area;
+      else
+        sum += 0.5 * std::abs(flux_b[0]*nx + flux_b[1]*ny + flux_b[2]*nz) * area;
+    }
+  }
+
+  g.DeleteAthenaArray();
+  gi.DeleteAthenaArray();
+  dg.DeleteAthenaArray();
+  return sum;
 }
 //----------------------------------------------------------------------------------------
 // Function responsible for storing useful quantities for output
