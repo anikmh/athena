@@ -24,6 +24,7 @@
 #include <cstdint>    // int64_t
 #include <cstdio>     // sscanf()
 #include <cstdlib>    // strtol
+#include <chrono>     // steady_clock
 #include <ctime>      // clock(), CLOCKS_PER_SEC, clock_t
 #include <exception>  // exception
 #include <iomanip>    // setprecision()
@@ -379,6 +380,15 @@ int main(int argc, char *argv[]) {
 #endif
     pmesh->Initialize(res_flag, pinput);
     // fprintf(stderr,"Mesh Initialization Done\n");
+    if (Globals::my_rank == 0) {
+      if (res_flag == 0)
+        std::cout << "Initial mesh: " << pmesh->nbtotal << " meshblocks ("
+                  << pmesh->nbtotal - pmesh->nbnew + pmesh->nbdel << " base + "
+                  << pmesh->nbnew - pmesh->nbdel << " from refinement)" << std::endl;
+      else
+        std::cout << "Mesh: " << pmesh->nbtotal << " meshblocks (from the restart file)"
+                  << std::endl;
+    }
 #ifdef ENABLE_EXCEPTIONS
   }
   catch(std::bad_alloc& ba) {
@@ -432,8 +442,6 @@ int main(int argc, char *argv[]) {
   // For performance, there is no error handler protecting this step (except outputs)
 
 
-    if (Globals::my_rank == 0)
-      fprintf(stderr,"Meshblocks created during initialization : %d Meshblocks Destroyed during initialization: %d\n", pmesh->nbnew,pmesh->nbdel);
 
 
   // if (MAGNETIC_FIELDS_ENABLED && METRIC_EVOLUTION && GENERAL_RELATIVITY && res_flag==1) {
@@ -441,10 +449,18 @@ int main(int argc, char *argv[]) {
   // }
 
   if (Globals::my_rank == 0) {
-    std::cout << "\nSetup complete, entering main loop...\n" << std::endl;
+    if (res_flag == 0) {
+      std::cout << "Setup done (mesh, initial state, t = 0 outputs)" << std::endl
+                << "Starting time integration ..." << std::endl;
+    } else {
+      char line[80];
+      std::snprintf(line, sizeof(line), "Setup done (restart file read, t = %.2f)",
+                    pmesh->time);
+      std::cout << line << std::endl << "Continuing time integration ..." << std::endl;
+    }
   }
 
-  clock_t tstart = clock();
+  std::chrono::steady_clock::time_point wall_start = std::chrono::steady_clock::now();
 #ifdef OPENMP_PARALLEL
   double omp_start_time = omp_get_wtime();
 #endif
@@ -452,8 +468,6 @@ int main(int argc, char *argv[]) {
   while ((pmesh->time < pmesh->tlim) &&
          (pmesh->nlim < 0 || pmesh->ncycle < pmesh->nlim)) {
 
-    int nbcreated_init = pmesh->nbnew;
-    int nbdestroyed_init = pmesh->nbdel;
     if (Globals::my_rank == 0)
       pmesh->OutputCycleDiagnostics();
     // if (Globals::my_rank == 0)
@@ -554,14 +568,6 @@ int main(int argc, char *argv[]) {
     pmesh->LoadBalancingAndAdaptiveMeshRefinement(pinput);
 
 
-    if (Globals::my_rank == 0){
-      if (pmesh->nbnew - nbcreated_init>0){
-        fprintf(stderr,"Meshblocks Created this time step: %d n", pmesh->nbnew - nbcreated_init);
-      }
-      if (pmesh->nbdel- nbdestroyed_init>0){
-      fprintf(stderr,"Meshblocks Destroyed this time step: %d\n", pmesh->nbdel- nbdestroyed_init);
-      }
-   }
 
     //this is only done once per timestep, not stage.  Per stage would be better, probably slower
     // if (METRIC_EVOLUTION && pmesh->ncycle % 10 == 0 && pmesh->ncycle >0) {
@@ -600,6 +606,7 @@ int main(int argc, char *argv[]) {
       break;
     }
   } // END OF MAIN INTEGRATION LOOP ======================================================
+  std::chrono::steady_clock::time_point wall_stop = std::chrono::steady_clock::now();
   // Make final outputs, print diagnostics, clean up and terminate
 
   if (Globals::my_rank == 0 && wtlim > 0)
@@ -642,40 +649,49 @@ int main(int argc, char *argv[]) {
 
   if (Globals::my_rank == 0) {
     if (SignalHandler::GetSignalFlag(SIGTERM) != 0) {
-      std::cout << std::endl << "Terminating on Terminate signal" << std::endl;
+      std::cout << "Terminating on Terminate signal" << std::endl;
     } else if (SignalHandler::GetSignalFlag(SIGINT) != 0) {
-      std::cout << std::endl << "Terminating on Interrupt signal" << std::endl;
+      std::cout << "Terminating on Interrupt signal" << std::endl;
     } else if (SignalHandler::GetSignalFlag(SIGALRM) != 0) {
-      std::cout << std::endl << "Terminating on wall-time limit" << std::endl;
+      std::cout << "Terminating on wall-time limit" << std::endl;
     } else if (pmesh->ncycle == pmesh->nlim) {
-      std::cout << std::endl << "Terminating on cycle limit" << std::endl;
+      std::cout << "Terminating on cycle limit" << std::endl;
     } else {
-      std::cout << std::endl << "Terminating on time limit" << std::endl;
+      std::cout << "Terminating on time limit" << std::endl;
     }
 
-    std::cout << "time=" << pmesh->time << " cycle=" << pmesh->ncycle << std::endl;
-    std::cout << "tlim=" << pmesh->tlim << " nlim=" << pmesh->nlim << std::endl;
+    char line[120];
+    std::snprintf(line, sizeof(line), "time = %.16e, cycle = %d", pmesh->time,
+                  pmesh->ncycle);
+    std::cout << line << std::endl;
+    std::snprintf(line, sizeof(line), "tlim = %.16e, nlim = %d", pmesh->tlim, pmesh->nlim);
+    std::cout << line << std::endl;
 
     if (pmesh->adaptive) {
-      std::cout << std::endl << "Number of MeshBlocks = " << pmesh->nbtotal
-                << "; " << pmesh->nbnew << "  created, " << pmesh->nbdel
-                << " destroyed during this simulation." << std::endl;
+      std::snprintf(line, sizeof(line), "# MeshBlocks = %d; created %d, destroyed %d.",
+                    pmesh->nbtotal, pmesh->nbnew, pmesh->nbdel);
+      std::cout << line << std::endl;
     }
 
-    // Calculate and print the zone-cycles/cpu-second and wall-second
+    // Zone-cycles, elapsed wall-clock time of the time integration (rank 0) and speed
 #ifdef OPENMP_PARALLEL
     double omp_time = omp_get_wtime() - omp_start_time;
 #endif
-    clock_t tstop = clock();
-    double cpu_time = (tstop>tstart ? static_cast<double> (tstop-tstart) :
-                       1.0)/static_cast<double> (CLOCKS_PER_SEC);
+    double wall_time = std::chrono::duration<double>(wall_stop - wall_start).count();
+    if (wall_time <= 0.0) wall_time = 1.0;
     std::uint64_t zonecycles = mbcnt
       *static_cast<std::uint64_t> (pmesh->my_blocks(0)->GetNumberOfMeshBlockCells());
-    double zc_cpus = static_cast<double> (zonecycles) / cpu_time;
+    double zc_walls = static_cast<double> (zonecycles) / wall_time;
 
-    std::cout << std::endl << "zone-cycles = " << zonecycles << std::endl;
-    std::cout << "cpu time used  = " << cpu_time << std::endl;
-    std::cout << "zone-cycles/cpu_second = " << zc_cpus << std::endl;
+    std::snprintf(line, sizeof(line), "Zone-cycles = %.3e (cell updates)",
+                  static_cast<double> (zonecycles));
+    std::cout << line << std::endl;
+    std::snprintf(line, sizeof(line), "Elapsed time = %.1f s (time integration, rank 0)",
+                  wall_time);
+    std::cout << line << std::endl;
+    std::snprintf(line, sizeof(line), "Speed = %.3e zone-cycles/s, %.3e per core",
+                  zc_walls, zc_walls/Globals::nranks);
+    std::cout << line << std::endl;
 #ifdef OPENMP_PARALLEL
     double zc_omps = static_cast<double> (zonecycles) / omp_time;
     std::cout << std::endl << "omp wtime used = " << omp_time << std::endl;

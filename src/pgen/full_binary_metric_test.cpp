@@ -969,7 +969,8 @@ void set_orbit_arrays(std::string orbit_file_name){
     // q = 1.0;
 
        
-    fprintf(stderr,"nt in set_orbit_arrays: %d \n q in set_orbit_arrays: %g \n", nt,q);
+    if (Globals::my_rank == 0)
+      std::cout << "Orbit file: " << nt << " rows, mass ratio q = " << q << std::endl;
 
     t_orbits.NewAthenaArray(nt);
     orbit_array.NewAthenaArray(Norbit,nt);

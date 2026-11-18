@@ -12,9 +12,11 @@
 
 // C++ headers
 #include <algorithm>
+#include <chrono>     // steady_clock
 #include <cinttypes>  // format macro "PRId64" for fixed-width integer type std::int64_t
 #include <cmath>      // std::abs(), std::pow()
 #include <cstdint>    // std::int64_t fixed-wdith integer type alias
+#include <cstdio>     // snprintf()
 #include <cstdlib>
 #include <cstring>    // std::memcpy()
 #include <iomanip>    // std::setprecision()
@@ -2244,7 +2246,6 @@ void Mesh::ApplyUserWorkBeforeOutput(ParameterInput *pin) {
 
 void Mesh::Initialize(int res_flag, ParameterInput *pin) {
   bool iflag = true;
-  int inb = nbtotal;
   int nthreads = GetNumMeshThreads();
 
   do {
@@ -2615,13 +2616,6 @@ void Mesh::Initialize(int res_flag, ParameterInput *pin) {
                   << std::endl
                   << "Possibly the refinement criteria have a problem." << std::endl;
       }
-      if (nbtotal > 2*inb && Globals::my_rank == 0) {
-        std::cout
-            << "### Warning in Mesh::Initialize" << std::endl
-            << "The number of MeshBlocks increased more than twice during initialization."
-            << std::endl
-            << "More computing power than you expected may be required." << std::endl;
-      }
     }
   } while (!iflag);
 
@@ -2933,14 +2927,49 @@ FluidFormulation GetFluidFormulation(const std::string& input_string) {
   }
 }
 
+// Wall-clock duration as a short string: seconds, minutes, hours or days.
+static std::string FormatDuration(double seconds) {
+  char text[32];
+  if (seconds < 60.0)
+    std::snprintf(text, sizeof(text), "%.0f s", seconds);
+  else if (seconds < 3600.0)
+    std::snprintf(text, sizeof(text), "%.1f min", seconds/60.0);
+  else if (seconds < 86400.0)
+    std::snprintf(text, sizeof(text), "%.1f h", seconds/3600.0);
+  else
+    std::snprintf(text, sizeof(text), "%.1f d", seconds/86400.0);
+  return std::string(text);
+}
+
+// One progress line every ncycle_out cycles: cycle, time (% of tlim) and dt; from the
+// second line on also the wall-clock time per cycle since the previous line, the elapsed
+// wall-clock time since the first line, and the time left to tlim at that speed.
 void Mesh::OutputCycleDiagnostics() {
+  static const std::chrono::steady_clock::time_point wall_start =
+      std::chrono::steady_clock::now();
+  static double wall_last = 0.0;
+  static int cycle_last = -1;
+  static Real time_last = 0.0;
   const int dt_precision = std::numeric_limits<Real>::max_digits10 - 1;
   const int ratio_precision = 3;
   if (ncycle_out != 0) {
     if (ncycle % ncycle_out == 0) {
-      std::cout << "cycle=" << ncycle << std::scientific
-                << std::setprecision(dt_precision)
-                << " time=" << time << " dt=" << dt;
+      double wall = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - wall_start).count();
+      char line[160];
+      int len = std::snprintf(line, sizeof(line), "cycle %d, t = %.2f (%.1f%%), dt = %.5f",
+                              ncycle, time, 100.0*time/tlim, dt);
+      if (cycle_last >= 0 && ncycle > cycle_last && time > time_last) {
+        double s_per_cycle = (wall - wall_last)/(ncycle - cycle_last);
+        double left = (tlim - time)/((time - time_last)/(ncycle - cycle_last))*s_per_cycle;
+        std::snprintf(line + len, sizeof(line) - len,
+                      ", %.1f s/cycle, elapsed %s, ~%s left", s_per_cycle,
+                      FormatDuration(wall).c_str(), FormatDuration(left).c_str());
+      }
+      wall_last = wall;
+      cycle_last = ncycle;
+      time_last = time;
+      std::cout << line;
       if (dt_diagnostics != -1) {
         if (STS_ENABLED) {
           if (UserTimeStep_ == nullptr)

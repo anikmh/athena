@@ -91,6 +91,7 @@
 #include "../athena_arrays.hpp"
 #include "../coordinates/coordinates.hpp"
 #include "../field/field.hpp"
+#include "../globals.hpp"
 #include "../gravity/gravity.hpp"
 #include "../hydro/hydro.hpp"
 #include "../mesh/mesh.hpp"
@@ -772,6 +773,29 @@ void OutputType::ClearOutputData() {
 }
 
 //----------------------------------------------------------------------------------------
+// One line for each snapshot (hdf5) or restart file just written (rank 0 only). The file
+// number has already been advanced to the next file, except for a final restart file.
+
+static void ReportOutput(const OutputParameters &op, const Mesh *pm, bool final_restart) {
+  if (Globals::my_rank != 0) return;
+  char line[100];
+  if (op.file_type == "hdf5") {
+    std::snprintf(line, sizeof(line), "Wrote snapshot %05d (t = %.2f, cycle %d)",
+                  op.file_number - 1, pm->time, pm->ncycle);
+  } else if (op.file_type == "rst" && final_restart) {
+    std::snprintf(line, sizeof(line), "Wrote restart final (t = %.2f, cycle %d)",
+                  pm->time, pm->ncycle);
+  } else if (op.file_type == "rst") {
+    std::snprintf(line, sizeof(line), "Wrote restart %05d (t = %.2f, cycle %d)",
+                  op.file_number - 1, pm->time, pm->ncycle);
+  } else {
+    return;
+  }
+  std::cout << line << std::endl;
+  return;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn void Outputs::MakeOutputs(Mesh *pm, ParameterInput *pin, bool wtflag)
 //! \brief scans through singly linked list of OutputTypes and makes any outputs needed.
 
@@ -792,6 +816,7 @@ void Outputs::MakeOutputsAll(Mesh *pm, ParameterInput *pin, bool wtflag) {
         first = false;
       }
       ptype->WriteOutputFile(pm, pin, wtflag);
+      ReportOutput(ptype->output_params, pm, wtflag);
     }
     ptype = ptype->pnext_type; // move to next OutputType node in singly linked list
   }
@@ -815,6 +840,7 @@ void Outputs::MakeOutputsExceptHst(Mesh *pm, ParameterInput *pin, bool wtflag) {
         first = false;
       }
       ptype->WriteOutputFile(pm, pin, wtflag);
+      ReportOutput(ptype->output_params, pm, wtflag);
     }
   }
   
